@@ -11,7 +11,16 @@ import re
 from importadores.ofx_reader import ler_ofx
 from importadores.pdf_extrato import ler_pdf_extrato
 
-app = FastAPI(title="OrquestraContabil API")
+app = FastAPI(title="OrquestraContabil API")  
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 class Conta(BaseModel):
