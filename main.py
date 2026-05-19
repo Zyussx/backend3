@@ -1,4 +1,9 @@
+
 from rapidfuzz import fuzz
+from importadores.plano_contas import ler_plano_contas
+from importadores.empresa_detector import detectar_empresa_pdf
+from importadores.ofx_reader import ler_ofx
+from importadores.pdf_extrato import ler_pdf_extrato
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -8,26 +13,14 @@ import pandas as pd
 import unicodedata
 import re
 
-from importadores.ofx_reader import ler_ofx
-from importadores.pdf_extrato import ler_pdf_extrato
+app = FastAPI(title="OrquestraContabil API")
 
-app = FastAPI(title="OrquestraContabil API")  
-
+empresas = []
+empresa_atual = None
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "https://frontend-chi-flame-33.vercel.app",
-        "https://orquestra-frontend.vercel.app",
-        "http://localhost:3000"
-    ],
+    allow_origins=["*", "http://localhost:3000", "https://frontend-chi-flame-33.vercel.app", "https://orquestra-frontend.vercel.app"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -61,53 +54,6 @@ def normalizar(txt: str) -> str:
     txt = unicodedata.normalize("NFD", str(txt or ""))
     return "".join(ch for ch in txt if unicodedata.category(ch) != "Mn").upper().strip()
 
-def identificar_grupo_conta(conta):
-    texto = normalizar(
-        f"{getattr(conta, 'codigo', '')} {getattr(conta, 'classificacao', '')} {getattr(conta, 'nome', '')} {getattr(conta, 'grupo', '')}"
-    )
-
-    if texto.startswith("1") or "ATIVO" in texto or "BANCO" in texto or "CLIENTE" in texto:
-        return "ATIVO"
-
-    if texto.startswith("2") or "PASSIVO" in texto or "FORNECEDOR" in texto:
-        return "PASSIVO"
-
-    if (
-        texto.startswith("3")
-        or texto.startswith("4")
-        or texto.startswith("5")
-        or "RESULTADO" in texto
-        or "RECEITA" in texto
-        or "DESPESA" in texto
-        or "CUSTO" in texto
-    ):
-        return "RESULTADO"
-
-    return "RESULTADO"
-
-
-def sinal_contabil(conta, natureza):
-    grupo = identificar_grupo_conta(conta)
-
-    if grupo == "ATIVO":
-        return "positivo" if natureza == "debito" else "negativo"
-
-    if grupo == "PASSIVO":
-        return "negativo" if natureza == "debito" else "positivo"
-
-    if grupo == "RESULTADO":
-        return "negativo" if natureza == "debito" else "positivo"
-
-    return "neutro"
-
-
-def procurar_conta_exata_ou_nome(contas, nome_conta):
-    conta = buscar_conta(contas, [nome_conta])
-    if conta:
-        return conta
-    return Conta(nome=nome_conta)
-
-
 def normalizar_coluna(txt: str) -> str:
     t = normalizar(txt).lower()
     t = t.replace(" ", "_").replace("/", "_").replace("-", "_")
@@ -127,6 +73,50 @@ def numero_br(valor):
     except Exception:
         return 0.0
 
+def identificar_grupo_conta(conta):
+    texto = normalizar(f"{getattr(conta, 'codigo', '')} {getattr(conta, 'classificacao', '')} {getattr(conta, 'nome', '')} {getattr(conta, 'grupo', '')}")
+    if texto.startswith("1") or "ATIVO" in texto or "BANCO" in texto or "CLIENTE" in texto:
+        return "ATIVO"
+    if texto.startswith("2") or "PASSIVO" in texto or "FORNECEDOR" in texto:
+        return "PASSIVO"
+    if texto.startswith("3") or texto.startswith("4") or texto.startswith("5") or "RESULTADO" in texto or "RECEITA" in texto or "DESPESA" in texto or "CUSTO" in texto:
+        return "RESULTADO"
+    return "RESULTADO"
+
+def sinal_contabil(conta, natureza):
+    grupo = identificar_grupo_conta(conta)
+    if grupo == "ATIVO":
+        return "positivo" if natureza == "debito" else "negativo"
+    if grupo == "PASSIVO":
+        return "negativo" if natureza == "debito" else "positivo"
+    if grupo == "RESULTADO":
+        return "negativo" if natureza == "debito" else "positivo"
+    return "neutro"
+
+def obter_ou_criar_empresa_auto(dados):
+    global empresa_atual
+    cnpj = dados.get("cnpj") or ""
+    nome = dados.get("nome") or ""
+    for emp in empresas:
+        if cnpj and emp.get("cnpj") == cnpj:
+            emp["codigo"] = dados.get("codigo") or emp.get("codigo")
+            emp["periodo"] = dados.get("periodo") or emp.get("periodo")
+            empresa_atual = emp
+            return emp
+    empresa = {
+        "id": len(empresas) + 1,
+        "codigo": dados.get("codigo"),
+        "nome": nome,
+        "cnpj": cnpj,
+        "periodo": dados.get("periodo"),
+        "plano_contas": [],
+        "memoria": [],
+        "extratos": [],
+    }
+    empresas.append(empresa)
+    empresa_atual = empresa
+    return empresa
+
 def buscar_conta(contas, termos):
     if isinstance(termos, str):
         termos = [termos]
@@ -138,6 +128,12 @@ def buscar_conta(contas, termos):
             if termo_n and (termo_n in nome or termo_n in classificacao):
                 return conta
     return None
+
+def procurar_conta_exata_ou_nome(contas, nome_conta):
+    conta = buscar_conta(contas, [nome_conta])
+    if conta:
+        return conta
+    return Conta(nome=nome_conta)
 
 def encontrar_melhor_conta(historico, contas):
     melhor_conta = None
@@ -153,14 +149,14 @@ def encontrar_melhor_conta(historico, contas):
             melhor_conta = conta
     return melhor_conta, melhor_score
 
-def conta_banco(contas: List[Conta], movimentos: List[Movimento]):
+def conta_banco(contas, movimentos):
     historicos = " ".join([normalizar(m.historico) for m in movimentos])
     bancos = {
         "ITAU": ["ITAU", "ITAU UNIBANCO"],
         "SICREDI": ["SICREDI"],
         "BRADESCO": ["BRADESCO"],
         "CAIXA": ["CAIXA"],
-        "BANCO DO BRASIL": ["BANCO DO BRASIL", "BB"]
+        "BANCO DO BRASIL": ["BANCO DO BRASIL", "BB"],
     }
     for banco, palavras in bancos.items():
         for palavra in palavras:
@@ -177,7 +173,7 @@ def aplicar_regra(historico, regras):
             return regra
     return None
 
-def normalizar_dataframe(df: pd.DataFrame):
+def normalizar_dataframe(df):
     df = df.copy()
     df.columns = [normalizar_coluna(c) for c in df.columns]
     mapa = {}
@@ -202,21 +198,6 @@ def normalizar_dataframe(df: pd.DataFrame):
         elif any(x in c for x in ["grupo", "tipo"]):
             mapa[col] = "grupo"
     df = df.rename(columns=mapa)
-    if "linha" in df.columns and len(df.columns) == 1:
-        linhas = []
-        for raw in df["linha"].astype(str).tolist():
-            linha = raw.strip()
-            m_data = re.search(r"(\d{2}/\d{2}(?:/\d{4})?)", linha)
-            valores = re.findall(r"[-]?\d{1,3}(?:\.\d{3})*,\d{2}", linha)
-            if m_data and valores:
-                valor = numero_br(valores[-2] if len(valores) >= 2 else valores[-1])
-                saldo = valores[-1] if len(valores) >= 2 else ""
-                historico = linha.replace(m_data.group(1), "").strip()
-                for v in valores:
-                    historico = historico.replace(v, "").strip()
-                linhas.append({"data": m_data.group(1), "historico": historico, "valor": valor, "documento": "", "saldo": saldo})
-        if linhas:
-            return pd.DataFrame(linhas)
     if "valor" in df.columns:
         df["valor"] = df["valor"].apply(numero_br)
     return df
@@ -224,6 +205,37 @@ def normalizar_dataframe(df: pd.DataFrame):
 @app.get("/")
 def health():
     return {"status": "online", "sistema": "OrquestraContabil"}
+
+@app.get("/empresas")
+async def listar_empresas():
+    return empresas
+
+@app.post("/empresa")
+async def criar_empresa(dados: dict):
+    global empresa_atual
+    empresa = {
+        "id": len(empresas) + 1,
+        "codigo": dados.get("codigo"),
+        "nome": dados.get("nome"),
+        "cnpj": dados.get("cnpj"),
+        "periodo": dados.get("periodo"),
+        "plano_contas": [],
+        "memoria": [],
+        "extratos": [],
+    }
+    empresas.append(empresa)
+    empresa_atual = empresa
+    return {"sucesso": True, "empresa": empresa}
+
+@app.post("/empresa/selecionar")
+async def selecionar_empresa(dados: dict):
+    global empresa_atual
+    empresa_id = dados.get("id")
+    for emp in empresas:
+        if emp["id"] == empresa_id:
+            empresa_atual = emp
+            return {"sucesso": True, "empresa": emp}
+    return {"erro": "Empresa não encontrada"}
 
 @app.post("/conciliar")
 def conciliar(payload: ConciliacaoRequest):
@@ -250,6 +262,7 @@ def conciliar(payload: ConciliacaoRequest):
             debito = conta_debito.nome if conta_debito else "Fornecedores/Despesa"
             confianca = 70
             observacao = "Saida bancaria identificada."
+
         if "COPEL" in h:
             conta = buscar_conta(contas, ["COPEL", "ENERGIA"])
             debito = conta.nome if conta else "Energia Eletrica"
@@ -280,6 +293,7 @@ def conciliar(payload: ConciliacaoRequest):
             credito = conta.nome if conta else "Receita de Servicos"
             confianca = 92
             observacao = "Receita de servico reconhecida."
+
         if conta_similar and score_similar >= 75:
             if mov.valor >= 0:
                 credito = conta_similar.nome
@@ -287,11 +301,10 @@ def conciliar(payload: ConciliacaoRequest):
                 debito = conta_similar.nome
             confianca = max(confianca, int(score_similar))
             observacao = f"Conta encontrada por similaridade ({int(score_similar)}%)."
-        status = "Conciliado" if confianca >= 90 else ("Revisar" if confianca >= 75 else "Pendente")
 
+        status = "Conciliado" if confianca >= 90 else ("Revisar" if confianca >= 75 else "Pendente")
         conta_debito_obj = procurar_conta_exata_ou_nome(contas, debito)
         conta_credito_obj = procurar_conta_exata_ou_nome(contas, credito)
-
         resultado.append({
             **mov.model_dump(),
             "debito": debito,
@@ -302,30 +315,49 @@ def conciliar(payload: ConciliacaoRequest):
             "grupo_debito": identificar_grupo_conta(conta_debito_obj),
             "grupo_credito": identificar_grupo_conta(conta_credito_obj),
             "sinal_debito": sinal_contabil(conta_debito_obj, "debito"),
-            "sinal_credito": sinal_contabil(conta_credito_obj, "credito")
+            "sinal_credito": sinal_contabil(conta_credito_obj, "credito"),
         })
     return {"lancamentos": resultado}
 
 @app.post("/upload-extrato")
 async def upload_extrato(arquivo: UploadFile = File(...)):
+    global empresa_atual
     sufixo = arquivo.filename.lower().split(".")[-1]
     with tempfile.NamedTemporaryFile(delete=False, suffix=f".{sufixo}") as temp:
         conteudo = await arquivo.read()
         temp.write(conteudo)
         caminho = temp.name
     try:
+        empresa_detectada = None
         if sufixo == "ofx":
             df = ler_ofx(caminho)
         elif sufixo == "pdf":
+            dados_empresa = detectar_empresa_pdf(caminho)
+            if dados_empresa.get("cnpj") or dados_empresa.get("nome"):
+                empresa_detectada = obter_ou_criar_empresa_auto(dados_empresa)
             df = ler_pdf_extrato(caminho)
         elif sufixo in ["csv", "txt"]:
             try:
-                df = pd.read_csv(caminho, sep=None, engine="python", encoding="utf-8")
-            except UnicodeDecodeError:
-                df = pd.read_csv(caminho, sep=None, engine="python", encoding="latin1")
+                df = ler_plano_contas(caminho)
+            except Exception:
+                try:
+                    df = pd.read_csv(caminho, sep=None, engine="python", encoding="utf-8")
+                except UnicodeDecodeError:
+                    df = pd.read_csv(caminho, sep=None, engine="python", encoding="latin1")
         else:
             return {"erro": "Formato não suportado"}
+
         df = normalizar_dataframe(df)
-        return {"sucesso": True, "linhas": df.fillna("").to_dict(orient="records")}
+        registros = df.fillna("").to_dict(orient="records")
+
+        if empresa_atual:
+            empresa_atual["plano_contas"] = registros
+
+        return {
+            "sucesso": True,
+            "empresa_detectada": empresa_detectada,
+            "empresa_atual": empresa_atual,
+            "linhas": registros,
+        }
     except Exception as e:
         return {"erro": str(e)}
